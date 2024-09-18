@@ -54,9 +54,9 @@ from EEGPipeline.auto_preproc import Preprocessor
 from EEGPipeline.extract_features import TS_Feature
 
 preproc = Preprocessor(
-    bids_root='/Users/alexe/Kaggle/EEG_tf_datasets/ds005305-download',
-    output_dir='Preproc_eeg_pipeline_test',
-    montage_path='/Users/alexe/Kaggle/EEG_tf_datasets/ds005305-download',
+    bids_root='/ds005305-download',
+    output_dir='Preproc_eeg',
+    montage_path='/ds005305-download',
     event_markers={'EO': 1, 'EC': 2},
     crop_events=True,
     preprocessing_steps=[

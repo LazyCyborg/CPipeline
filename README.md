@@ -48,7 +48,7 @@ Chenot Quentin and Hamery Caroline and Truninger Moritz and De Boissezon Xavier 
 ```
 !pip install git+https://github.com/LazyCyborg/EEGPipeline.git
 ```
-#### Example usage 
+#### Example usage for preprocessing
 ```
 from EEGPipeline.auto_preproc import Preprocessor
 from EEGPipeline.extract_features import TS_Feature

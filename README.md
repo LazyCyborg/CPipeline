@@ -43,6 +43,12 @@ https://openneuro.org/datasets/ds005305/versions/1.0.1
 
 Chenot Quentin and Hamery Caroline and Truninger Moritz and De Boissezon Xavier and Langer Nicolas and Scannella Sébastien (2024). EEG Resting-state Microstates Correlates of Executive Functions. OpenNeuro. [Dataset] doi: doi:10.18112/openneuro.ds005305.v1.0.1
 
+#### Install
+
+```
+!pip install git+https://github.com/LazyCyborg/EEGPipeline.git
+
+```
 #### Example usage 
 ```
 from EEGPipeline.auto_preproc import Preprocessor

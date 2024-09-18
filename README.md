@@ -47,7 +47,6 @@ Chenot Quentin and Hamery Caroline and Truninger Moritz and De Boissezon Xavier 
 
 ```
 !pip install git+https://github.com/LazyCyborg/EEGPipeline.git
-
 ```
 #### Example usage 
 ```

@@ -22,6 +22,7 @@ class TS_Feature:
         self.time_delta = pd.Timedelta(seconds=td_seconds)
         self.data_dir = data_dir
         self.individual_cluster_centers = []
+        self.segmentations = []
         self.segmentation_labels = []
         self.microstate_dfs = []
         self.entropy_dfs = []  # List to store entropy DataFrames
@@ -375,7 +376,7 @@ class TS_Feature:
 
    
     def cluster_eeg(
-    self, n_clusters=5, random_state=42, max_iter=1000,
+    self, n_clusters=5, n_jobs=-1, random_state=42, max_iter=1000,
     min_peak_distance=2, verbose=True, reject_by_annotation=True, raw=True,
     subjects=None  # Add subjects parameter
 ):
@@ -384,6 +385,7 @@ class TS_Feature:
 
         Parameters:
             n_clusters (int): Number of clusters.
+            n_jobs (int): The number of jobs to run in parallel. If -1, it is set to the number of CPU cores. Requires the joblib package.
             random_state (int): Random seed.
             max_iter (int): Maximum number of iterations.
             min_peak_distance (int): Minimum distance between peaks.
@@ -443,7 +445,7 @@ class TS_Feature:
                 modk = ModKMeans(
                     n_clusters=n_clusters, random_state=random_state, max_iter=max_iter
                 )
-                modk.fit(gfp_peaks)
+                modk.fit(gfp_peaks, n_jobs=n_jobs)
                 cluster_centers = modk.cluster_centers_
 
                 if len(modk.info['ch_names']) == 64:
@@ -488,7 +490,7 @@ class TS_Feature:
             raw (bool): If True, process raw data; else, process epochs.
 
         Returns:
-            list: Segmentation labels for each subject.
+           list: Segmentation objects for each subject, list: Segmentation labels for each subject.
         """
         if raw:
             file_suffix = "_preproc_raw.fif"
@@ -537,12 +539,13 @@ class TS_Feature:
                     min_segment_length=min_segment_length,
                     reject_edges=reject_edges,
                 )
+                self.segmentations.append((n, segmentation))
                 self.segmentation_labels.append((n, segmentation.labels))
             else:
                 print("Number of channels is not 64. Skipping.")
                 continue
 
-        return self.segmentation_labels
+        return self.segmentations, self.segmentation_labels
 
     def create_segmentation_df(self):
         """
@@ -590,7 +593,6 @@ class TS_Feature:
         else:
             print("Segmentation DataFrame is empty. Please create the DataFrame before saving.")
     
-            
 
     def plot_ModK(self):
         """

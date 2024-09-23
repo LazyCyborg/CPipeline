@@ -349,7 +349,7 @@ class TS_Feature:
             )
             psd_df['subject'] = n
 
-            self.psd_dfs.append(psd_df)
+            self.psd_dfs.append(psd_df) 
 
         # Concatenate all PSD DataFrames into one
         if self.psd_dfs:
@@ -570,6 +570,10 @@ class TS_Feature:
                 {'target': labels_flat, 'subject': subjects_array},
                 index=datetime_index
             )
+            
+            # Remove rows with target == -1
+            df = df[df['target'] != -1]
+
             self.microstate_dfs.append(df)
 
         self.microstate_df = pd.concat(self.microstate_dfs)
@@ -578,6 +582,7 @@ class TS_Feature:
         self.df.set_index('timestamp', inplace=True)
 
         return self.microstate_df
+
 
 
     def save_segmentation_hdf(self, fname):

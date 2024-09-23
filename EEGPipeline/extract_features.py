@@ -547,9 +547,12 @@ class TS_Feature:
 
         return self.segmentations, self.segmentation_labels
 
-    def create_segmentation_df(self):
+    def create_segmentation_df(self, remove_space=True):
         """
         Create a DataFrame from the segmentation labels for further analysis.
+
+        Parameters:
+            remove_space (bool): Whether to remove -1 labels between microstates
         """
         if not self.segmentation_labels:
             print("EEG data is not segmented. Please run 'segment_eeg' first.")
@@ -571,8 +574,9 @@ class TS_Feature:
                 index=datetime_index
             )
             
-            # Remove rows with target == -1
-            df = df[df['target'] != -1]
+            if remove_space == True:
+                # Remove rows with target == -1
+                df = df[df['target'] != -1]
 
             self.microstate_dfs.append(df)
 

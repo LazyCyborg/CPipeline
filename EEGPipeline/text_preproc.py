@@ -1,5 +1,6 @@
 import os
 import numpy as np
+import pandas as pd
 import torch
 import torchaudio
 import torchaudio.functional as F
@@ -7,185 +8,80 @@ import torchaudio.transforms as T
 from transformers import pipeline
 from textacy.preprocessing import normalize, remove, replace, pipeline as pp
 from functools import partial
+from typing import Dict, List, Optional, Union, Tuple
+import logging
 
+from .configs import AudioConfig, PreprocessConfig
 
 class PreprocTranscribeAudio:
     """
     A class for preprocessing audio files and transcribing them using ASR models.
     """
 
-    def __init__(self, audio_dir, model_name="openai/whisper-large-v3", whisper=True):
+    def __init__(
+        self,
+        audio_dir: str,
+        model_name: str = "openai/whisper-large-v3",
+        whisper: bool = True,
+        audio_config: Optional[AudioConfig] = None,
+        preprocess_config: Optional[PreprocessConfig] = None,
+        device: Optional[str] = None
+    ):
         """
         Initialize the PreprocTranscribeAudio class.
 
-        Parameters:
-        - audio_dir (str): Directory containing the audio files to process.
-        - model_name (str): The name of the ASR model to use.
-        - whisper (bool): Whether to use Whisper-specific parameters.
+        Args:
+            audio_dir: Directory containing audio files
+            model_name: Name of the ASR model to use
+            whisper: Whether to use Whisper-specific parameters
+            audio_config: Configuration for audio processing
+            preprocess_config: Configuration for text preprocessing
+            device: Computing device (auto-detected if None)
         """
         self.audio_dir = audio_dir
         self.files = sorted(os.listdir(audio_dir))
         self.model_name = model_name
         self.whisper = whisper
-        self.asr_data = {}
-        self.sentences = []
-        self.device = self._get_device()
+        
+        # Use provided configs or defaults
+        self.audio_config = audio_config or AudioConfig()
+        self.preprocess_config = preprocess_config or PreprocessConfig()
+        
+        # Initialize other attributes
+        self.device = self._get_device(device)
         self.transcriber = pipeline(
             "automatic-speech-recognition",
             model=self.model_name,
-            device=self.device
+            device=self.device if isinstance(self.device, int) else -1
         )
         self.text_preprocessor = self._initialize_text_preprocessor()
+        self.transcriptions = {}
+        self.processed_data = pd.DataFrame()
+        
+        # Set up logging
+        logging.basicConfig(level=logging.INFO)
+        self.logger = logging.getLogger(__name__)
 
-    def _get_device(self):
-        """
-        Determine the appropriate device to use (MPS, CUDA, or CPU).
-
-        Returns:
-        - device (str or int): The device identifier for the pipeline.
-        """
-        if torch.backends.mps.is_available():
-            device = 'mps'
-        elif torch.cuda.is_available():
-            device = 0  # First CUDA device
+    def _get_device(self, device: Optional[str] = None) -> Union[str, int]:
+        """Determine the appropriate device to use."""
+        if device is not None:
+            return device
+        
+        if torch.cuda.is_available():
+            return 0
+        elif torch.backends.mps.is_available():
+            return 'mps'
         else:
-            device = -1  # CPU
-        return device
+            return -1
 
-    def load_audio(self, filename):
-        """
-        Load an audio file.
-
-        Parameters:
-        - filename (str): The name of the audio file to load.
-
-        Returns:
-        - speech_tensor (torch.Tensor): The loaded audio tensor.
-        - sampling_rate (int): The sampling rate of the audio.
-        """
-        if filename.endswith('.wav'):
-            file_path = os.path.join(self.audio_dir, filename)
-            speech_tensor, sampling_rate = torchaudio.load(file_path)
-            return speech_tensor, sampling_rate
-        else:
-            raise ValueError(f"Unsupported file format for file: {filename}")
-
-    def apply_filters(self, speech_tensor, sampling_rate, lowpass_freq=300, highpass_freq=2000):
-        """
-        Apply lowpass and highpass filters to the audio.
-
-        Parameters:
-        - speech_tensor (torch.Tensor): The audio tensor.
-        - sampling_rate (int): The sampling rate of the audio.
-        - lowpass_freq (float): The cutoff frequency for the lowpass filter.
-        - highpass_freq (float): The cutoff frequency for the highpass filter.
-
-        Returns:
-        - torch.Tensor: The filtered audio tensor.
-        """
-        speech_tensor = F.lowpass_biquad(speech_tensor, sampling_rate, lowpass_freq)
-        speech_tensor = F.highpass_biquad(speech_tensor, sampling_rate, highpass_freq)
-        return speech_tensor
-
-    def resample_audio(self, speech_tensor, sampling_rate, target_rate=16000):
-        """
-        Resample audio to the target sample rate.
-
-        Parameters:
-        - speech_tensor (torch.Tensor): The audio tensor.
-        - sampling_rate (int): The original sampling rate.
-        - target_rate (int): The target sampling rate.
-
-        Returns:
-        - torch.Tensor: The resampled audio tensor.
-        """
-        resampler = T.Resample(orig_freq=sampling_rate, new_freq=target_rate)
-        speech_tensor = resampler(speech_tensor)
-        return speech_tensor
-
-    def convert_to_numpy(self, speech_tensor):
-        """
-        Convert audio tensor to numpy array and handle mono audio.
-
-        Parameters:
-        - speech_tensor (torch.Tensor): The audio tensor.
-
-        Returns:
-        - numpy.ndarray: The audio data as a numpy array.
-        """
-        if speech_tensor.size(0) == 1:
-            speech_tensor = speech_tensor.squeeze(0)
-        else:
-            # Convert to mono by averaging channels if stereo
-            speech_tensor = torch.mean(speech_tensor, dim=0)
-        return speech_tensor.numpy()
-
-    def chunk_audio(self, audio_np, target_rate, chunk_duration=6):
-        """
-        Chunk the audio into segments of `chunk_duration` seconds.
-
-        Parameters:
-        - audio_np (numpy.ndarray): The audio data as a numpy array.
-        - target_rate (int): The sampling rate of the audio.
-        - chunk_duration (float): The duration of each chunk in seconds.
-
-        Returns:
-        - List[numpy.ndarray]: A list of audio chunks.
-        """
-        chunk_length = int(chunk_duration * target_rate)  # Chunk duration in samples
-        num_chunks = (len(audio_np) + chunk_length - 1) // chunk_length  # Ceiling division
-        chunks = []
-        for i in range(num_chunks):
-            start = i * chunk_length
-            end = start + chunk_length
-            audio_chunk = audio_np[start:end]
-            if len(audio_chunk) < chunk_length:
-                # Pad the last chunk if necessary
-                audio_chunk = np.pad(audio_chunk, (0, chunk_length - len(audio_chunk)), mode='constant')
-            chunks.append(audio_chunk)
-        return chunks
-
-    def transcribe_chunked_audio(self, audio_chunks):
-        """
-        Transcribe the audio chunks using the specified model.
-
-        Parameters:
-        - audio_chunks (List[numpy.ndarray]): A list of audio chunks.
-
-        Returns:
-        - List[str]: A list of transcriptions for each chunk.
-        """
-        transcriptions = []
-        for audio_chunk in audio_chunks:
-            if self.whisper:
-                transcription = self.transcriber(audio_chunk, generate_kwargs={"language": "swedish"})
-            else:
-                transcription = self.transcriber(audio_chunk)
-            transcriptions.append(transcription['text'])
-        return transcriptions
-
-    def _initialize_text_preprocessor(self):
-        """
-        Initialize the text preprocessing pipeline.
-
-        Returns:
-        - Callable: A preprocessing function that can be applied to texts.
-        """
-        preproc = pp.make_pipeline(
-            # Normalization Steps
+    def _initialize_text_preprocessor(self) -> callable:
+        """Initialize the text preprocessing pipeline based on config."""
+        steps = [
             normalize.unicode,
-            normalize.quotation_marks,
-            normalize.hyphenated_words,
-            #remove.punctuation,  # Remove all punctuation
-            # partial(normalize.repeating_chars, chars=2),  # Truncate repeating chars to max 2
-            normalize.bullet_points,
             normalize.whitespace,
-
-            # Removal Steps
+            normalize.bullet_points,
             remove.html_tags,
             remove.brackets,
-
-            # Replacement Steps
             partial(replace.urls, repl="_URL_"),
             partial(replace.emails, repl="_EMAIL_"),
             partial(replace.phone_numbers, repl="_PHONE_"),
@@ -194,98 +90,211 @@ class PreprocTranscribeAudio:
             partial(replace.emojis, repl="_EMOJI_"),
             partial(replace.numbers, repl="_NUMBER_"),
             partial(replace.currency_symbols, repl="_CURRENCY_"),
-        )
-        return preproc
+        ]
 
-    def preprocess_text(self, text):
-        """
-        Preprocess a single text string using the predefined pipeline.
+        if self.preprocess_config.normalize_chars:
+            steps.extend([
+                normalize.quotation_marks,
+                normalize.hyphenated_words,
+            ])
 
-        Parameters:
-        - text (str): The text to preprocess.
+        if self.preprocess_config.remove_punctuation:
+            steps.append(remove.punctuation)
 
-        Returns:
-        - str: The preprocessed text.
-        """
-        preproc = self.text_preprocessor(text)
-        self.sentences = preproc.split('.')
+        if self.preprocess_config.max_repeating_chars:
+            steps.append(
+                partial(normalize.repeating_chars, 
+                       chars=self.preprocess_config.max_repeating_chars)
+            )
 
-        return self.sentences
+        return pp.make_pipeline(*steps)
 
-    def preproc_transcribe_audio(self, speech_tensor, sampling_rate,
-                                 lowpass_freq=300, highpass_freq=2000,
-                                 target_rate=16000, chunk_duration=6):
-        """
-        Complete preprocessing and transcription pipeline for a single audio tensor.
+    def load_audio(self, filename: str) -> Tuple[torch.Tensor, int]:
+        """Load an audio file and validate its format."""
+        if not filename.endswith('.wav'):
+            raise ValueError(f"Unsupported file format for file: {filename}")
+            
+        file_path = os.path.join(self.audio_dir, filename)
+        try:
+            speech_tensor, sampling_rate = torchaudio.load(file_path)
+            self.logger.info(f"Loaded audio file: {filename}")
+            return speech_tensor, sampling_rate
+        except Exception as e:
+            self.logger.error(f"Failed to load audio file {filename}: {str(e)}")
+            raise
 
-        Parameters:
-        - speech_tensor (torch.Tensor): The audio tensor.
-        - sampling_rate (int): The sampling rate of the audio.
-        - lowpass_freq (float): The cutoff frequency for the lowpass filter.
-        - highpass_freq (float): The cutoff frequency for the highpass filter.
-        - target_rate (int): The target sampling rate.
-        - chunk_duration (float): The duration of each chunk in seconds.
-
-        Returns:
-        - str: The preprocessed transcription of the audio.
-        """
+    def process_audio(
+        self,
+        speech_tensor: torch.Tensor,
+        sampling_rate: int
+    ) -> torch.Tensor:
+        """Process audio with filtering and resampling."""
         # Apply filters
-        speech_tensor = self.apply_filters(speech_tensor, sampling_rate, lowpass_freq, highpass_freq)
+        speech_tensor = F.lowpass_biquad(
+            speech_tensor,
+            sampling_rate,
+            self.audio_config.lowpass_freq
+        )
+        speech_tensor = F.highpass_biquad(
+            speech_tensor,
+            sampling_rate,
+            self.audio_config.highpass_freq
+        )
 
-        # Resample the audio
-        speech_tensor = self.resample_audio(speech_tensor, sampling_rate, target_rate)
+        # Resample audio
+        speech_tensor = T.Resample(
+            orig_freq=sampling_rate,
+            new_freq=self.audio_config.target_rate
+        )(speech_tensor)
 
-        # Convert to numpy
-        audio_np = self.convert_to_numpy(speech_tensor)
+        # Convert to mono if needed
+        if speech_tensor.size(0) > 1:
+            speech_tensor = torch.mean(speech_tensor, dim=0, keepdim=True)
 
-        # Chunk the audio
-        audio_chunks = self.chunk_audio(audio_np, target_rate, chunk_duration)
+        return speech_tensor
 
-        # Transcribe the chunked audio
-        transcriptions = self.transcribe_chunked_audio(audio_chunks)
+    def chunk_audio(
+        self,
+        audio: torch.Tensor
+    ) -> List[np.ndarray]:
+        """Split audio into chunks for processing."""
+        audio_np = audio.numpy().squeeze()
+        chunk_length = int(self.audio_config.chunk_duration * 
+                         self.audio_config.target_rate)
+        
+        chunks = []
+        for i in range(0, len(audio_np), chunk_length):
+            chunk = audio_np[i:i + chunk_length]
+            if len(chunk) < chunk_length:
+                chunk = np.pad(
+                    chunk,
+                    (0, chunk_length - len(chunk)),
+                    mode='constant'
+                )
+            chunks.append(chunk)
+        
+        return chunks
 
-        # Combine transcriptions
-        full_transcription = " ".join(transcriptions)
-
-        # Preprocess the transcription
-        preprocessed_transcription = self.preprocess_text(full_transcription)
-
-        return preprocessed_transcription
-
-    def process_all_files(self, lowpass_freq=300, highpass_freq=2000,
-                          target_rate=16000, chunk_duration=6):
-        """
-        Process and transcribe all audio files in the directory.
-
-        Parameters:
-        - lowpass_freq (float): The cutoff frequency for the lowpass filter.
-        - highpass_freq (float): The cutoff frequency for the highpass filter.
-        - target_rate (int): The target sampling rate.
-        - chunk_duration (float): The duration of each chunk in seconds.
-
-        Returns:
-        - Dict[str, str]: A dictionary with filenames as keys and preprocessed transcriptions as values.
-        """
-        transcriptions = {}
-        for filename in self.files:
-            if filename.endswith('.wav'):
-                try:
-                    # Load audio
-                    speech_tensor, sampling_rate = self.load_audio(filename)
-
-                    # Preprocess and transcribe
-                    preprocessed_transcription = self.preproc_transcribe_audio(
-                        speech_tensor, sampling_rate,
-                        lowpass_freq, highpass_freq,
-                        target_rate, chunk_duration
+    def transcribe_chunks(
+        self,
+        chunks: List[np.ndarray]
+    ) -> str:
+        """Transcribe audio chunks and combine results."""
+        transcriptions = []
+        
+        for chunk in chunks:
+            try:
+                if self.whisper:
+                    result = self.transcriber(
+                        chunk,
+                        generate_kwargs={"language": "swedish"}
                     )
+                else:
+                    result = self.transcriber(chunk)
+                
+                transcriptions.append(result['text'])
+                self.logger.debug(f"Transcribed chunk: {result['text']}")
+                
+            except Exception as e:
+                self.logger.error(f"Failed to transcribe chunk: {str(e)}")
+                continue
 
-                    transcriptions[filename] = preprocessed_transcription
-                    print(f"Processed {filename}:")
-                    print(preprocessed_transcription)
-                    print("-" * 50)
-                except Exception as e:
-                    print(f"Failed to process {filename}: {e}")
-            else:
-                print(f"Skipping unsupported file format: {filename}")
-        return transcriptions
+        return ' '.join(transcriptions)
+
+    def preprocess_text(self, text: str) -> List[str]:
+        """Preprocess transcribed text and split into sentences."""
+        # Apply preprocessing pipeline
+        processed_text = self.text_preprocessor(text)
+        
+        # Split into sentences and filter
+        sentences = [s.strip() for s in processed_text.split('.')
+                    if len(s.strip().split()) >= 
+                    self.preprocess_config.min_sentence_length]
+
+        return sentences
+
+    def process_file(self, filename: str) -> Optional[List[str]]:
+        """Process a single audio file through the complete pipeline."""
+        try:
+            # Load audio
+            speech_tensor, sampling_rate = self.load_audio(filename)
+            
+            # Process audio
+            processed_audio = self.process_audio(speech_tensor, sampling_rate)
+            
+            # Chunk audio
+            chunks = self.chunk_audio(processed_audio)
+            
+            # Transcribe
+            transcription = self.transcribe_chunks(chunks)
+            
+            # Preprocess text
+            sentences = self.preprocess_text(transcription)
+            
+            self.logger.info(f"Successfully processed file: {filename}")
+            return sentences
+            
+        except Exception as e:
+            self.logger.error(f"Failed to process file {filename}: {str(e)}")
+            return None
+
+    def process_all_files(self) -> pd.DataFrame:
+        """
+        Process all audio files and return results as a DataFrame.
+        """
+        data = []
+        
+        for filename in self.files:
+            if not filename.endswith('.wav'):
+                self.logger.info(f"Skipping non-WAV file: {filename}")
+                continue
+                
+            sentences = self.process_file(filename)
+            if sentences:
+                self.transcriptions[filename] = sentences
+                
+                for i, sentence in enumerate(sentences, 1):
+                    data.append({
+                        'Filename': filename,
+                        'Sentence_Number': i,
+                        'Sentence': sentence,
+                        'Audio_Block': f"A{len(data) // 2 + 1}",
+                        'Timestamp': f"{i * self.audio_config.chunk_duration:.1f}s"
+                    })
+
+        # Create DataFrame
+        self.processed_data = pd.DataFrame(data)
+        if not self.processed_data.empty:
+            self.processed_data.set_index(['Filename', 'Sentence_Number'], inplace=True)
+        
+        return self.processed_data
+
+    def save_results(
+        self,
+        output_path: str,
+        format: str = 'csv'
+    ) -> None:
+        """
+        Save processing results to file.
+
+        Args:
+            output_path: Path to save the results
+            format: Output format ('csv' or 'hdf')
+        """
+        if self.processed_data.empty:
+            self.logger.warning("No data to save")
+            return
+
+        try:
+            if format == 'csv':
+                self.processed_data.to_csv(output_path)
+            elif format == 'hdf':
+                self.processed_data.to_hdf(
+                    output_path,
+                    key='transcription_data',
+                    mode='w'
+                )
+            self.logger.info(f"Results saved to {output_path}")
+            
+        except Exception as e:
+            self.logger.error(f"Failed to save results: {str(e)}")

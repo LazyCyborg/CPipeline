@@ -1,139 +1,248 @@
-from mne_faster import find_bad_channels, find_bad_epochs, find_bad_channels_in_epochs
-from mne_icalabel import label_components
+# eeg_preprocessor.py
 
 import os
 import numpy as np
 import mne
 from mne.preprocessing import ICA
-from mne_bids import BIDSPath, read_raw_bids
-from mne_faster import find_bad_channels, find_bad_epochs
+from mne_bids import BIDSPath
+from mne_faster import find_bad_channels, find_bad_epochs, find_bad_channels_in_epochs
 from mne_icalabel import label_components
-
-from mne_bids import (
-    BIDSPath,
-    find_matching_paths,
-    get_entity_vals,
-    make_report,
-    print_dir_tree,
-    read_raw_bids,
-)
 
 class EEGPreprocessor:
     def __init__(
-        self, bids_root, output_dir='Preproc_eeg_pipeline', montage_path=None, 
-        extensions = ['.set', '.fif', '.edf'],
-        event_markers=None, crop_events=True, preprocessing_steps=None
+        self, data_loader, output_dir='Preproc_eeg_pipeline', preprocessing_steps=None
     ):
         """
         Initialize the Preprocessor.
 
         Parameters:
-            bids_root (str): The root directory of the BIDS dataset.
-            output_dir (str): The directory where preprocessed data will be saved.
-            montage_path (str): Path to the montage files.
-            event_markers (dict): Dictionary specifying event markers.
-                Example: {'start_marker': 1, 'stop_marker': 2}
-            crop_events (bool): Whether to crop data based on events.
+            data_loader: An instance of EEGDataLoader.
+            output_dir (str): Directory to save preprocessed data.
             preprocessing_steps (list): List of preprocessing steps to perform.
                 Options include: 'set_eeg_reference', 'filter', 'interpolate_bad_channels',
                 'find_bad_channels', 'find_bad_epochs', 'ica', 'baseline_correction',
-                'filter_epochs', 'set_average_reference'.
+                'filter_epochs', 'set_average_reference', 'crop_data', 'find_bad_channels_in_epochs'.
         """
-        self.bids_root = bids_root
+        self.data_loader = data_loader
         self.output_dir = output_dir
-        self.montage_path = montage_path
-        self.event_markers = event_markers if event_markers else {}
-        self.crop_events = crop_events
         self.preprocessing_steps = preprocessing_steps if preprocessing_steps else []
-        self.extensions = extensions  ### Add more extensions if other data is going ot be processed 
-        self.bids_path = self.find_matching_paths()  
-        self.subjects = self.get_subjects() 
+        self.subjects = self.data_loader.get_subjects()
 
+        # Mapping step names to functions
+        self.step_functions_raw = {
+            'set_eeg_reference': self.set_eeg_reference,
+            'filter': self.filter_raw,
+            'crop_data': self.crop_subject_data,
+        }
 
-    def find_matching_paths(self):
+        self.step_functions_epochs = {
+            'interpolate_bad_channels': self.interpolate_bad_channels,
+            'find_bad_channels': self.find_bad_channels_method,
+            'find_bad_channels_in_epochs': self.find_bad_channels_in_epochs_method,
+            'find_bad_epochs': self.find_bad_epochs_method,
+            'ica': self.apply_ica,
+            'baseline_correction': self.apply_baseline_correction,
+            'filter_epochs': self.filter_epochs,
+            'set_average_reference': self.set_average_reference,
+        }
+
+    def run_preprocessing(self, reference_channel):
         """
-        Find all matching BIDS paths for the dataset.
-
-        Returns:
-            List of file paths.
-        """
-        bids_root = self.bids_root 
-        sessions = get_entity_vals(bids_root, "session",)
-        datatype = "eeg"
-        extensions = [".fdt", ".set", ".tsv", '.json'] 
-        self.bids_path = find_matching_paths(
-            bids_root, datatypes=datatype, sessions=sessions, extensions=extensions
-        )
-        return self.bids_path
-
-    def get_subjects(self):
-        """
-        Extract unique subject IDs from the BIDS paths.
-
-        Returns:
-            List of subject identifiers.
-        """
-        subjects = [n.subject for n in self.bids_path]
-        subjects = list(dict.fromkeys(subjects))
-        return subjects
-
-    def load_subject_raw(self, subject):
-        """
-        Load raw EEG data for a subject.
+        Run the preprocessing pipeline for all subjects.
 
         Parameters:
+            reference_channel (str): Name of the reference channel, e.g., 'CZ'.
+        """
+        for subject in self.subjects:
+            raw, events, channels = self.data_loader.load_subject_data(subject)
+            if raw is None:
+                print(f"No raw data found for subject {subject}. Skipping.")
+                continue
+
+            preprocessing_info = {}
+
+            # Set montage
+            self.set_montage(raw, subject)
+            preprocessing_info['set_montage'] = "Applied standard or custom montage"
+
+            # Apply preprocessing steps to raw data
+            raw = self.apply_preprocessing_steps_raw(raw, reference_channel, events)
+            if raw is None:
+                continue
+
+            # Epoching
+            if events is None or not events.size:
+                print("No events found. Skipping epoching.")
+                epochs = None
+                initial_epoch_count = 0
+            else:
+                tmin, tmax = -0.5, 1.0
+                try:
+                    unique_event_ids = np.unique(events[:, 2])
+                    event_id = {str(e): int(e) for e in unique_event_ids}
+                    epochs = mne.Epochs(raw, events, event_id=event_id, tmin=tmin, tmax=tmax,
+                                        baseline=None, preload=True, reject_by_annotation=True)
+                    initial_epoch_count = len(epochs)
+                    print(f"Initial number of epochs for subject {subject}: {initial_epoch_count}")
+                except Exception as error:
+                    print(f"An exception occurred during initial epoching for subject {subject}: {error}.")
+                    initial_epoch_count = 0
+                    epochs = None
+
+            if epochs is not None:
+                # Preprocess epochs
+                epochs = self.apply_preprocessing_steps_epochs(epochs, subject)
+                if epochs is None:
+                    print(f"Preprocessing failed for subject {subject}.")
+                    continue
+
+                # Save preprocessed data
+                self.save_preprocessed_data(epochs, subject)
+            else:
+                print("No epochs available to preprocess.")
+
+    def apply_preprocessing_steps_raw(self, raw, reference_channel, events):
+        """
+        Apply preprocessing steps to raw data.
+
+        Parameters:
+            raw (Raw): The raw EEG data.
+            reference_channel (str): Name of the reference channel.
+            events (ndarray): The events array.
+
+        Returns:
+            raw (Raw): The preprocessed raw data.
+        """
+        for step in self.preprocessing_steps:
+            func = self.step_functions_raw.get(step, None)
+            if func is not None:
+                try:
+                    if step == 'set_eeg_reference':
+                        raw = func(raw, reference_channel)
+                    elif step == 'crop_data':
+                        raw = func(raw, events)
+                    else:
+                        raw = func(raw)
+                    print(f"Applied {step} to raw data.")
+                except Exception as error:
+                    print(f"An error occurred during {step} on raw data: {error}")
+            else:
+                # Step not applicable to raw data
+                pass
+        return raw
+
+    def apply_preprocessing_steps_epochs(self, epochs, subject):
+        """
+        Apply preprocessing steps to epochs.
+
+        Parameters:
+            epochs (Epochs): The epochs to preprocess.
             subject (str): Subject identifier.
 
         Returns:
-            raw (Raw): The raw EEG data.
+            epochs (Epochs): The preprocessed epochs.
         """
-        print(f"Loading data for subject: {subject}")
-        bids_path = BIDSPath(
-            subject=subject, root=self.bids_root, datatype='eeg',
-            task="restingstate", suffix="eeg", extension=".set"
-        )
-        try:
-            raw = read_raw_bids(bids_path=bids_path, verbose=False)
-            raw.load_data()
-            return raw
-        except Exception as e:
-            print(f"Could not read data for subject {subject}: {e}")
-            return None
+        for step in self.preprocessing_steps:
+            func = self.step_functions_epochs.get(step, None)
+            if func is not None:
+                try:
+                    epochs = func(epochs)
+                    print(f"Applied {step} to epochs.")
+                except Exception as error:
+                    print(f"An error occurred during {step} on epochs: {error}")
+            else:
+                # Step not applicable to epochs
+                pass
+        return epochs
 
-    def crop_subject_data(self, raw):
+    def set_montage(self, raw, subject):
+        """
+        Set the montage for the raw data.
+
+        Parameters:
+            raw (Raw): The raw EEG data.
+            subject (str): Subject identifier.
+        """
+        if not self.data_loader.montage_path:
+            print("No montage path provided. Skipping montage setting.")
+            return
+
+        montage_fname = os.path.join(
+            self.data_loader.montage_path, f"sub-{subject}", "eeg",
+            f"sub-{subject}_task-restingstate_electrodes.tsv"
+        )
+        if os.path.isfile(montage_fname):
+            montage = mne.channels.read_custom_montage(fname=montage_fname)
+            # Adjust positions if necessary
+            positions = montage.get_positions()['ch_pos']
+            for ch_name, pos in positions.items():
+                x, y, z = pos
+                positions[ch_name] = np.array([y, x, z]) / 1000.0  # Swap x and y, convert mm to m
+            montage = mne.channels.make_dig_montage(ch_pos=positions, coord_frame='head')
+            raw.set_montage(montage, on_missing='raise', verbose=False)
+            # Verify the head radius
+            radius, _, _ = mne.bem.fit_sphere_to_headshape(raw.info, units='m')
+            print(f"Estimated head radius for subject {subject}: {radius * 100:.2f} cm")
+        else:
+            print(f"Montage file not found for subject {subject}.")
+
+    def set_eeg_reference(self, raw, reference_channel):
+        """
+        Set the EEG reference channel.
+
+        Parameters:
+            raw (Raw): The raw EEG data.
+            reference_channel (str): Name of the reference channel.
+
+        Returns:
+            raw (Raw): The raw data with reference set.
+        """
+        raw.set_eeg_reference(ref_channels=[reference_channel])
+        return raw
+
+    def filter_raw(self, raw):
+        """
+        Apply band-pass filter to raw data.
+
+        Parameters:
+            raw (Raw): The raw EEG data.
+
+        Returns:
+            raw (Raw): The filtered raw data.
+        """
+        raw.filter(l_freq=1, h_freq=100, verbose=False)
+        return raw
+
+    def crop_subject_data(self, raw, events):
         """
         Crop the raw data based on event markers.
 
         Parameters:
             raw (Raw): The raw EEG data.
+            events (ndarray): The events array.
 
         Returns:
             raw_cropped (Raw): The cropped raw data.
         """
-        if not self.crop_events or not self.event_markers:
-            print("Skipping data cropping.")
-            return raw
-
-        print('Cropping data based on event markers')
-        events_array, _ = mne.events_from_annotations(raw, event_id='auto')
-
-        if not events_array.size:
+        if events is None or not events.size:
             print("No events found. Skipping cropping.")
             return raw
 
         # Create a list of start and stop times based on event markers
-        start_marker = self.event_markers.get('start_marker')
-        stop_marker = self.event_markers.get('stop_marker')
+        start_marker = self.data_loader.event_markers.get('start_marker')
+        stop_marker = self.data_loader.event_markers.get('stop_marker')
         if start_marker is None or stop_marker is None:
             print("Start or stop marker not defined in event_markers.")
             return raw
 
         event_times = {start_marker: [], stop_marker: []}
 
-        for event in events_array:
+        for event in events:
             event_id = event[2]
-            if event_id in event_times:
-                event_times[event_id].append(event[0] / raw.info['sfreq'])
+            if event_id == start_marker:
+                event_times[start_marker].append(event[0] / raw.info['sfreq'])
+            elif event_id == stop_marker:
+                event_times[stop_marker].append(event[0] / raw.info['sfreq'])
 
         # Assume events are paired (e.g., start and stop markers)
         cropped_raws = []
@@ -151,155 +260,150 @@ class EEGPreprocessor:
         raw_cropped = mne.concatenate_raws(cropped_raws, preload=True)
         return raw_cropped
 
-    def set_montage(self, raw, subject):
+    def interpolate_bad_channels(self, epochs):
         """
-        Set the montage for the raw data.
+        Interpolate channels with zero variance.
 
         Parameters:
-            raw (Raw): The raw EEG data.
-            subject (str): Subject identifier.
-        """
-        if not self.montage_path:
-            print("No montage path provided. Skipping montage setting.")
-            return
-
-        montage_fname = os.path.join(
-            self.montage_path, f"sub-{subject}", "eeg",
-            f"sub-{subject}_task-restingstate_electrodes.tsv"
-        )
-        if os.path.isfile(montage_fname):
-            montage = mne.channels.read_custom_montage(fname=montage_fname)
-            # Convert positions from mm to m and adjust axes if necessary
-            positions = montage.get_positions()['ch_pos']
-            for ch_name, pos in positions.items():
-                x, y, z = pos
-                # Adjust axes as needed (e.g., swap x and y)
-                positions[ch_name] = np.array([y, x, z]) / 1000.0  # Swap x and y, convert mm to m
-            montage = mne.channels.make_dig_montage(ch_pos=positions, coord_frame='head')
-            raw.set_montage(montage, on_missing='raise', verbose=False)
-            # Verify the head radius
-            radius, _, _ = mne.bem.fit_sphere_to_headshape(raw.info, units='m')
-            print(f"Estimated head radius for subject {subject}: {radius * 100:.2f} cm")
-        else:
-            print(f"Montage file not found for subject {subject}.")
-
-    def preprocess_subject_epochs(self, raw, subject, reference):
-        """
-        Preprocess epochs for a subject.
-
-        Parameters:
-            raw (Raw): The raw EEG data.
-            subject (str): Subject identifier.
-            reference (str): Name of the reference channel, e.g., 'CZ'.
+            epochs (Epochs): The epochs to process.
 
         Returns:
-            epochs (Epochs): The preprocessed epochs.
+            epochs (Epochs): The epochs with bad channels interpolated.
         """
-        print(f"Preprocessing data for subject {subject}")
+        data = epochs.get_data()
+        zero_variance_channels = np.where(data.var(axis=2).mean(axis=0) == 0)[0]
+        if zero_variance_channels.size > 0:
+            channels_to_interpolate = [epochs.ch_names[idx] for idx in zero_variance_channels]
+            print(f"Interpolating channels with zero variance: {channels_to_interpolate}")
+            epochs.info['bads'] = list(set(epochs.info['bads']).union(set(channels_to_interpolate)))
+            epochs.interpolate_bads(reset_bads=True)
+        return epochs
 
-        # Apply EEG reference and filtering
-        if 'set_eeg_reference' in self.preprocessing_steps:
-            raw.set_eeg_reference(ref_channels=[reference])
-        if 'filter' in self.preprocessing_steps:
-            raw.filter(l_freq=1, h_freq=100, verbose=False)
+    def find_bad_channels_method(self, epochs):
+        """
+        Detect and interpolate bad channels.
 
-        # Create epochs
+        Parameters:
+            epochs (Epochs): The epochs to process.
+
+        Returns:
+            epochs (Epochs): The epochs with bad channels interpolated.
+        """
         try:
-            epochs = mne.make_fixed_length_epochs(
-                raw, duration=2.0, preload=True,
-                reject_by_annotation=True, proj=True, overlap=0.0, verbose=False
-            )
+            bad_channels = find_bad_channels(epochs, eeg_ref_corr=False)
+            if bad_channels:
+                print(f"Bad channels detected: {bad_channels}")
+                epochs.info['bads'] = list(set(epochs.info['bads']).union(set(bad_channels)))
+                epochs.interpolate_bads(reset_bads=True)
         except Exception as error:
-            print(f"An exception occurred during epoching for subject {subject}: {error}.")
-            return None
-
-        # Apply additional preprocessing steps
-        epochs = self.apply_preprocessing_steps(epochs, subject)
-
+            print(f"An exception occurred during bad channel detection: {error}.")
         return epochs
 
-    def apply_preprocessing_steps(self, epochs, subject):
+    def find_bad_channels_in_epochs_method(self, epochs):
         """
-        Apply preprocessing steps to the epochs.
+        Find bad channels within epochs and interpolate.
 
         Parameters:
-            epochs (Epochs): The epochs to preprocess.
-            subject (str): Subject identifier.
+            epochs (Epochs): The epochs to process.
 
         Returns:
-            epochs (Epochs): The preprocessed epochs.
+            epochs (Epochs): The epochs with bad channels interpolated.
         """
-        if 'interpolate_bad_channels' in self.preprocessing_steps:
-            # Interpolate zero variance channels
-            data = epochs.get_data()
-            zero_variance_channels = np.where(data.var(axis=2).mean(axis=0) == 0)[0]
-            if zero_variance_channels.size > 0:
-                channels_to_interpolate = [epochs.ch_names[idx] for idx in zero_variance_channels]
-                print(f"Interpolating channels with zero variance: {channels_to_interpolate}")
-                epochs.info['bads'] = list(set(epochs.info['bads']).union(set(channels_to_interpolate)))
+        try:
+            bad_channels_epochs = find_bad_channels_in_epochs(epochs)
+            if bad_channels_epochs:
+                # Flatten the list if it's a list of lists
+                bad_channels_epochs = [ch for sublist in bad_channels_epochs for ch in sublist]
+                print(f"Bad channels in epochs detected: {bad_channels_epochs}")
+                # Mark them as bad and interpolate
+                epochs.info['bads'] = list(set(epochs.info['bads']).union(set(bad_channels_epochs)))
                 epochs.interpolate_bads(reset_bads=True)
-
-        if 'find_bad_channels' in self.preprocessing_steps:
-            # Mark bad channels
-            try:
-                bad_channels = find_bad_channels(epochs, eeg_ref_corr=False)
-                if bad_channels:
-                    print(f"Bad channels detected: {bad_channels}")
-                    epochs.info['bads'] = list(set(epochs.info['bads']).union(set(bad_channels)))
-                    epochs.interpolate_bads(reset_bads=True)
-            except Exception as error:
-                print(f"An exception occurred during bad channel detection for subject {subject}: {error}.")
-
-        if 'find_bad_channels_in_epochs' in self.preprocessing_steps:
-            # Find bad channels within epochs
-            try:
-                bad_channels_epochs = find_bad_channels_in_epochs(epochs)
-                if bad_channels_epochs:
-                    # Flatten the list if it's a list of lists
-                    bad_channels_epochs = [ch for sublist in bad_channels_epochs for ch in sublist]
-                    print(f"Bad channels in epochs detected: {bad_channels_epochs}")
-                    # Mark them as bad and interpolate
-                    epochs.info['bads'] = list(set(epochs.info['bads']).union(set(bad_channels_epochs)))
-                    epochs.interpolate_bads(reset_bads=True)
-            except Exception as error:
-                print(f"An exception occurred during bad channel detection in epochs for subject {subject}: {error}.")
-
-        if 'find_bad_epochs' in self.preprocessing_steps:
-            # Mark bad epochs
-            try:
-                bad_epochs = find_bad_epochs(epochs)
-                if bad_epochs:
-                    print(f"Dropping bad epochs: {bad_epochs}")
-                    epochs.drop(bad_epochs)
-            except Exception as error:
-                print(f"An exception occurred during bad epoch detection for subject {subject}: {error}.")
-
-        if 'ica' in self.preprocessing_steps:
-            # Independent Component Analysis (ICA)
-            try:
-                ica = ICA(n_components=15, max_iter="auto", random_state=42, method='infomax', fit_params=dict(extended=True))
-                ica.fit(epochs)
-                label_components(epochs, ica, method='iclabel')
-                ica.exclude = []
-                for key, components in ica.labels_.items():
-                    if key != 'brain' and components:
-                        ica.exclude.extend(components)
-                if ica.exclude:
-                    ica.apply(epochs)
-            except Exception as error:
-                print(f"An exception occurred during ICA for subject {subject}: {error}.")
-
-        if 'baseline_correction' in self.preprocessing_steps:
-            epochs.apply_baseline(epochs.baseline)
-
-        if 'filter_epochs' in self.preprocessing_steps:
-            epochs.filter(l_freq=2, h_freq=20, verbose=False)
-
-        if 'set_average_reference' in self.preprocessing_steps:
-            epochs.set_eeg_reference('average', projection=False)
-
+        except Exception as error:
+            print(f"An exception occurred during bad channel detection in epochs: {error}.")
         return epochs
 
+    def find_bad_epochs_method(self, epochs):
+        """
+        Detect and drop bad epochs.
+
+        Parameters:
+            epochs (Epochs): The epochs to process.
+
+        Returns:
+            epochs (Epochs): The epochs with bad epochs dropped.
+        """
+        try:
+            bad_epochs = find_bad_epochs(epochs)
+            if bad_epochs:
+                print(f"Dropping bad epochs: {bad_epochs}")
+                epochs.drop(bad_epochs)
+        except Exception as error:
+            print(f"An exception occurred during bad epoch detection: {error}.")
+        return epochs
+
+    def apply_ica(self, epochs):
+        """
+        Apply Independent Component Analysis (ICA) to epochs.
+
+        Parameters:
+            epochs (Epochs): The epochs to process.
+
+        Returns:
+            epochs (Epochs): The epochs after ICA.
+        """
+        try:
+            ica = ICA(n_components=15, max_iter="auto", random_state=42, method='infomax', fit_params=dict(extended=True))
+            ica.fit(epochs)
+            label_components(epochs, ica, method='iclabel')
+            ica.exclude = []
+            for key, components in ica.labels_.items():
+                if key != 'brain' and components:
+                    ica.exclude.extend(components)
+            if ica.exclude:
+                ica.apply(epochs)
+                print(f"Applied ICA and removed components: {ica.exclude}")
+        except Exception as error:
+            print(f"An exception occurred during ICA: {error}.")
+        return epochs
+
+    def apply_baseline_correction(self, epochs):
+        """
+        Apply baseline correction to epochs.
+
+        Parameters:
+            epochs (Epochs): The epochs to process.
+
+        Returns:
+            epochs (Epochs): The baseline-corrected epochs.
+        """
+        epochs.apply_baseline(epochs.baseline)
+        return epochs
+
+    def filter_epochs(self, epochs):
+        """
+        Apply band-pass filter to epochs.
+
+        Parameters:
+            epochs (Epochs): The epochs to process.
+
+        Returns:
+            epochs (Epochs): The filtered epochs.
+        """
+        epochs.filter(l_freq=2, h_freq=20, verbose=False)
+        return epochs
+
+    def set_average_reference(self, epochs):
+        """
+        Set average reference for epochs.
+
+        Parameters:
+            epochs (Epochs): The epochs to process.
+
+        Returns:
+            epochs (Epochs): The epochs with average reference set.
+        """
+        epochs.set_eeg_reference('average', projection=False)
+        return epochs
 
     def save_preprocessed_data(self, epochs, subject):
         """
@@ -309,28 +413,8 @@ class EEGPreprocessor:
             epochs (Epochs): The preprocessed epochs.
             subject (str): Subject identifier.
         """
-        datadir = os.path.join(self.bids_root, self.output_dir)
+        datadir = os.path.join(self.data_loader.data_path, self.output_dir)
         os.makedirs(datadir, exist_ok=True)
         fname = os.path.join(datadir, f"sub_{subject}_preproc_raw-epo.fif")
         epochs.save(fname, overwrite=True, verbose=False)
         print(f"Saved preprocessed data for subject {subject} to {fname}")
-
-    def run_preprocessing(self, reference_channel):
-        """
-        Run the preprocessing pipeline for all subjects.
-
-        Parameters:
-            reference_channel (str): Name of the reference channel, e.g., 'CZ'.
-        """
-        for subject in self.subjects:
-            raw = self.load_subject_raw(subject)
-            if raw is None:
-                continue
-            if self.crop_events:
-                raw = self.crop_subject_data(raw)
-            self.set_montage(raw, subject)
-            epochs = self.preprocess_subject_epochs(raw, subject, reference_channel)
-            if epochs is not None:
-                self.save_preprocessed_data(epochs, subject)
-            else:
-                print(f"Preprocessing failed for subject {subject}.")

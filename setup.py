@@ -23,7 +23,7 @@ setup(
         'pycrostates>=0.2.0',
         'antropy>=0.3.0',
         'textacy>=0.10.0',
-        'neurone-loader',  # If this is a custom package, ensure it's available on PyPI or include it appropriately
+        'neurone-loader', 
         'torch>=1.7.1',
         'torchaudio>=0.7.2',
         'transformers>=4.0.0',

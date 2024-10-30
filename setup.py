@@ -36,6 +36,7 @@ setup(
         'transformers>=4.0.0',
         'textacy>=0.10.0',
         'pycrostates>=0.2.0',
+        'antropy>=0.1.6',
     ],
     extras_require={
         'dev': [

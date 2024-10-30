@@ -19,6 +19,7 @@ setup(
         'torch>=1.7.1',
         'torchaudio>=0.7.2',
         'transformers>=4.0.0',
+        'sentence-transformers>=3.0.0',
         'textacy>=0.10.0',
         'pycrostates>=0.2.0',
         'textacy>=0.10.0',

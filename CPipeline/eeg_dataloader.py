@@ -1,7 +1,6 @@
 import os
 import numpy as np
 import mne
-import pyxdf
 from mne_bids import (
     BIDSPath,
     find_matching_paths,
@@ -175,80 +174,6 @@ class EEGDataLoader:
             return None, None, None
 
         events, event_id = mne.events_from_annotations(raw)
-        channels = raw.info['ch_names']
-        return raw, events, channels
-
-    def load_xdf_file(self, xdf_file, sfreq=5000):
-        """
-        Load an XDF file and extract the raw data and events.
-
-        Parameters:
-            xdf_file (str): Path to the XDF file.
-
-        Returns:
-            raw (Raw): The raw EEG data.
-            events (ndarray): The events array.
-            channels (list): List of channel names.
-        """
-        import pyxdf
-
-        # Load the XDF file
-        streams, header = pyxdf.load_xdf(xdf_file)
-
-        # Find the EEG stream
-        eeg_stream = None
-        for stream in streams:
-            if stream['info']['type'][0].lower() == 'eeg':
-                eeg_stream = stream
-                break
-
-        if eeg_stream is None:
-            raise ValueError("No EEG stream found in the XDF file.")
-
-        # Extract data and transpose it
-        data = eeg_stream['time_series'].T
-        data *= 1e-6  # Scaling to volts
-
-        # Sampling frequency
-        sfreq = float(eeg_stream['info']['nominal_srate'][0])
-
-        # Channel names
-        try:
-            ch_dict = eeg_stream['info']['desc'][0]['channels'][0]['channel']
-            ch_names = [ch['label'][0] for ch in ch_dict]
-        except (TypeError, KeyError, IndexError):
-            ch_names = [f'EEG {i+1}' for i in range(data.shape[0])]
-
-        # Channel types
-        ch_types = ['eeg'] * len(ch_names)
-
-        # Create MNE Info object
-        info = mne.create_info(ch_names=ch_names, sfreq=sfreq, ch_types=ch_types)
-
-        # Create Raw object
-        raw = mne.io.RawArray(data, info)
-
-        # Handle events (Markers)
-        events = []
-        event_id = {}
-        # Extract marker streams if present
-        for stream in streams:
-            if stream['info']['type'][0].lower() == 'markers':
-                time_stamps = stream['time_stamps']
-                markers = stream['time_series']
-                for idx, marker in enumerate(markers):
-                    # Find the sample index corresponding to the time_stamp
-                    sample_idx = int((time_stamps[idx] - eeg_stream['time_stamps'][0]) * sfreq)
-                    # Convert marker to string
-                    marker_value = marker[0]
-                    if isinstance(marker_value, bytes):
-                        marker_value = marker_value.decode('utf-8')
-                    # If the marker is not in event_id, assign a new id
-                    if marker_value not in event_id:
-                        event_id[marker_value] = len(event_id) + 1
-                    events.append([sample_idx, 0, event_id[marker_value]])
-
-        events = np.array(events) if events else None
         channels = raw.info['ch_names']
         return raw, events, channels
 
